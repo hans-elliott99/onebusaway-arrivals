@@ -1,0 +1,9 @@
+
+.venv
+.env
+*.log
+*.db
+*.parquet
+
+kcm_schedule_files
+

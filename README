@@ -1,0 +1,23 @@
+
+The initial goal was just to download or request historical arrival time data for statistical analysis, but I discovered that the open data does not include any historical records - there are GTFS schedule files and real time data via the OneBusAway API.  
+
+OneBusAway does not seem to track "actual arrival times", just scheduled times and live predictions (i.e., the predictions you see on the app - "3 minutes away, etc.). The live predictions can not be accessed after a trip ends (otherwise, I'd just query some past dates).  
+  
+However, when a trip has passed a given stop *but* the trip is still live, I can still query its predicted arrival time.  
+
+A trip's predicted arrival time at a given stop is continuously updated as the bus approaches the stop, but once the bus has passed the stop, it's prediction stops changing. From my own experience with the OneBusAway app, these final predicted times are usually quite accurate - even though initial predictions can be very off, when the bus does pass your stop the app typically knows this.  
+So the plan is to use the "final predicted arrival time" as a proxy for "actual arrival time".  
+
+The key is to request the predicted arrival time of a given trip at a given stop **after** the trip has passed the stop, but **before** the trip ends.
+
+
+
+
+Notes:
+
+Schedule files from here: https://www.soundtransit.org/help-contacts/business-information/open-transit-data-otd/otd-downloads
+Downloaded 2025-01-19
+
+
+https://pypi.org/project/onebusaway/
+
