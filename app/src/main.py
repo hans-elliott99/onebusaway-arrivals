@@ -20,6 +20,12 @@ from onebusaway import OnebusawaySDK
 load_dotenv()
 
 
+if os.environ.get("LOCAL"):
+    PATH_PREFIX = "./app/"
+else:
+    PATH_PREFIX = "./"
+
+
 
 def current_service_date():
     dt = (
@@ -374,13 +380,16 @@ async def stoptrip_task(task_id: int,
 
 
 
-STOP_ID = "1_29278"   # 23rd & Republican
-DBPATH  = "./scrape.db"
-LOGPATH = f"./scrape_{datetime.datetime.now().date()}.log"
 
 
 
-async def main(logger: logging.Logger):
+async def daily_process(
+        client: OBAClient,
+        dbconn: SqliteDB,
+        logger: logging.Logger,
+        stop_id: str,
+        current_date: str
+    ):
     """
     Firt we query the stop schedule for the stop of interest.
     Then we loop through all scheduled arrivals at the stop and add their
@@ -402,82 +411,106 @@ async def main(logger: logging.Logger):
     I believe we'd need to fully monitor a vehicle to get that info.
     But this doesn't apply to my current stops of interest.
     """
-    # initialize
+    # load stop schedule for the current service date
+    logger.info(f"** STOP ID: {stop_id} | SERVICE DATE: {current_date}")
+    logger.info(f"** Querying stop schedule...")
+    stop_schedule = client.query_stop_schedule(
+        stop_id=stop_id,
+        date=current_date
+    )
+    stop_schedule.write_parquet(PATH_PREFIX + f"stop_schedule/{stop_id}__{current_date}.parquet")
+
+    logger.info("** Queueing up work and generating async tasks...")
+    # add each stop-trip to the work queue to be processed
+    work_queue = asyncio.Queue()
+    for i in range(stop_schedule.height):
+        trip = stop_schedule.filter(row_ix=i)
+        params = StopTripTaskParams(
+            stop_id=stop_id,
+            trip_id=trip["trip_id"].item(),
+            service_date=trip["service_date"].item(),
+            scheduled_arrival=trip["arrival_time"].item(),
+            schedule_id=i
+        )
+        await work_queue.put(params)
+    
+    # generate tasks to process the queue concurrently
+    task_list = [
+        asyncio.create_task(
+            stoptrip_task(i, client, dbconn, logger, work_queue)
+        ) for i in range(stop_schedule.height)
+    ]
+
+    # run the tasks
+    if len(task_list) > 0:
+        logger.info("** Running tasks...")
+        await asyncio.gather(*task_list)
+        logger.info("** Tasks all finished.")
+    else:
+        logger.info("** No tasks to run!")
+    logger.info("**")
+
+
+
+
+
+STOP_ID = "1_29278"   # 23rd & Republican
+DBPATH  = PATH_PREFIX + "scrape.db"
+LOGPATH = PATH_PREFIX + f"scrape_{datetime.datetime.now().date()}.log"
+def main():
+    logger = get_logger(LOGPATH)
+    logger.setLevel(logging.INFO)
+    logger.info("-------------------------------------------------")
+    logger.info(f"Starting app.") 
+
     client = OBAClient(
         api_key=os.environ.get("ONEBUSAWAY_API_KEY"),
         logger=logger
     )
     dbconn = SqliteDB(DBPATH)
-    work_queue = asyncio.Queue()
+
     current_date = current_service_date()
-    # initial stop schedule
-    stop_schedule = client.query_stop_schedule(
-        stop_id=STOP_ID,
-        date=current_date
-    )
-    stop_schedule.write_parquet(f"./stop_schedule/{STOP_ID}_{current_date}.parquet")
-    stop_schedule_date = current_date
-    need_to_queue_work = True
-
-    while True:
-        logger.info("* Main loop iteration")
-        current_date = current_service_date()
-        if current_date != stop_schedule_date:
-            logger.info(f"** Refreshing stop schedule (service date is now {current_date})")
-            # refresh schedule
-            stop_schedule = client.query_stop_schedule(
-                stop_id=STOP_ID,
-                date=current_date
-            )
-            stop_schedule.write_parquet(f"./stop_schedule/{STOP_ID}_{current_date}.parquet")
-            stop_schedule_date = current_date
-            need_to_queue_work = True
-
-        if need_to_queue_work:
-            need_to_queue_work = False
-            logger.info("** Queueing up work...")
-            # add each stop-trip to the work queue to be processed
-            for i in range(stop_schedule.height):
-                trip = stop_schedule.filter(row_ix=i)
-                params = StopTripTaskParams(
-                    stop_id=STOP_ID,
-                    trip_id=trip["trip_id"].item(),
-                    service_date=trip["service_date"].item(),
-                    scheduled_arrival=trip["arrival_time"].item(),
-                    schedule_id=i
-                )
-                await work_queue.put(params)
-            
-            # generate tasks to process the queue concurrently
-            task_list = [
-                asyncio.create_task(
-                    stoptrip_task(i, client, dbconn, logger, work_queue)
-                ) for i in range(stop_schedule.height)
-            ]
-
-        # run the tasks
-        if len(task_list) > 0:
-            logger.info("** Running tasks...")
-            await asyncio.gather(*task_list)
-            logger.info("** Tasks all finished.")
-        else:
-            logger.info("** No tasks to run.")
-        logger.info("**")
-        time.sleep(10)
-    dbconn.close() # not reached...
-                
-
-if __name__ == "__main__":
-    logger = get_logger(LOGPATH)
-    logger.setLevel(logging.INFO)
-    logger.info("---------------------------------")
-    logger.info(f"Starting app.") 
+    previous_date = current_date - datetime.timedelta(days=1) # start with yesterday
 
     try:
-        asyncio.run(main(logger))
+
+        while True:
+            logger.info("-------------------------------------------------iter")
+            # check if it's a new day
+            current_date = current_service_date()
+            if current_date == previous_date:
+                # This will only be reached if all relevant trips have ended
+                # for the current service date BUT we haven't moved to the
+                # next service date yet. In practice, that should only happen
+                # late at night close to 3am, i.e., close to when the service
+                # date changes.
+                # In this case, we can just let the program sleep for a while
+                # and then check back
+                logger.info(f"* Same service date ({current_date}), taking a nap. Zzzzz...")
+                time.sleep(60 * 10) # sleep for 10 minutes
+            else:
+                logger.info(f"* New service date detected: {current_date}")
+                previous_date = current_date
+                asyncio.run(
+                    daily_process(
+                        client=client,
+                        dbconn=dbconn,
+                        logger=logger,
+                        stop_id=STOP_ID,
+                        current_date=current_date
+                    )
+                )
+
     except (Exception, KeyboardInterrupt) as e:
         if isinstance(e, KeyboardInterrupt):
             logger.info("Keyboard interrupt received. Exiting app.")
         else:
             logger.error(f"Error: {e}")
         logger.info("Exiting app.")
+
+        dbconn.close()
+        client.client.close()
+    
+
+if __name__ == "__main__":
+    main()
