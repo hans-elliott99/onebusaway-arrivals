@@ -234,7 +234,7 @@ class SqliteDB:
         c = self.conn.cursor()
         c.execute(
         "CREATE TABLE IF NOT EXISTS arrivals " +
-        "(stop_id TEXT, trip_id TEXT, service_date TEXT, schedule_id INTEGER, scheduled_arrival INTEGER, last_predicted_arrival INTEGER, distance_when_scraped REAL, time_when_scraped INTEGER)"
+        "(stop_id TEXT, trip_id TEXT, service_date INTEGER, schedule_id INTEGER, scheduled_arrival INTEGER, last_predicted_arrival INTEGER, distance_when_scraped REAL, time_when_scraped INTEGER)"
         )
         self.conn.commit()
         c.close()
@@ -526,6 +526,14 @@ def main():
         else:
             logger.error(f"Error: {e}")
 
+        # add entry for interruption 
+        exit_time = time.time() * 1000
+        dbconn.insert_arrival(
+            stop_id="-1", trip_id="-1", service_date="0",
+            schedule_id=-1, scheduled_arrival=0,
+            last_predicted_arrival=0, distance_when_scraped=0,
+            time_when_scraped=exit_time
+        )
         logger.info("Exiting app.")
         dbconn.close()
         client.close()
