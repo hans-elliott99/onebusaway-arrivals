@@ -21,9 +21,9 @@ load_dotenv()
 
 
 if os.environ.get("LOCAL"):
-    PATH_PREFIX = "./app/"
+    PATH_PREFIX = "./app/data/"
 else:
-    PATH_PREFIX = "./"
+    PATH_PREFIX = "./data/"
 
 
 
@@ -434,7 +434,7 @@ async def daily_process(
         stop_ids=stop_ids,
         date=current_date
     )
-    stop_schedule.write_parquet(PATH_PREFIX + f"stop_schedule/{current_date}.parquet")
+    stop_schedule.write_parquet(PATH_PREFIX + f"{current_date}.parquet")
 
     logger.info("** Queueing up work and generating async tasks...")
     # add each stop-trip to the work queue to be processed

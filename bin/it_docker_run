@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+
+sudo docker container run -it -v /home/hans/onebusaway-arrivals/app/data:/app/data  onebusaway-arrivals bash
