@@ -262,6 +262,9 @@ def get_logger(filepath):
     logger = logging.getLogger("mainlog")
     logger.setLevel(logging.INFO)
     formatter = logging.Formatter('%(asctime)s - %(levelname)s:  %(message)s')
+    formatter.converter = lambda *args: datetime.datetime.now(
+        tz=pytz.timezone("US/Pacific")
+    ).timetuple()
 
     ch = logging.StreamHandler()
     ch.setFormatter(formatter)
