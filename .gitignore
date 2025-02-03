@@ -5,5 +5,5 @@
 *.db
 *.parquet
 
-kcm_schedule_files
+data/
 

@@ -3,7 +3,7 @@
 # Tracking real time bus data from OneBusAway
 # H. Elliott 2025
 #
-
+from __future__ import annotations
 import os
 import time
 import datetime
@@ -104,9 +104,23 @@ def _query_stop_schedule(client, stop_id, date):
         pl.col("arrival_time_str").dt.minute().alias("minute")
     )
     stop_schedule = stop_schedule.sort("arrival_time_str").with_columns(
-        row_ix=pl.Series(range(stop_schedule.height))
+        stop_id=pl.lit(stop_id)
     )
     return stop_schedule
+
+
+def _query_stop_schedules(client, stop_ids, date):
+    """
+    return a dictionary of stop schedules
+    """
+    dfs = []
+    for stop_id in stop_ids:
+        dfs.append( _query_stop_schedule(client, stop_id, date) )
+    out = pl.concat(dfs, how="vertical_relaxed")
+    out = out.with_columns(
+        row_ix=pl.Series(range(out.height)),
+    )
+    return out
 
 
 def _query_arrival_time(client, stop_id, trip_id, service_date):
@@ -138,7 +152,7 @@ class OBAClient:
         self.max_attempts = max_attempts
         self.sleep_time = sleep_time
         self.total_fails = 0
-        self.client = self.connect()
+        self._client = self.connect()
     
     def connect(self):
         ret = -2
@@ -160,11 +174,11 @@ class OBAClient:
         #
         raise Exception("Failed to connect to OneBusAway")
     
-    def query_stop_schedule(self, stop_id, date):
+    def query_stop_schedules(self, stop_ids, date):
         # if we've failed too many times, try to reconnect
         if self.total_fails > self.max_attempts * 5:
             self.logger.info("Attempting to reconnecting to OneBusAway...")
-            self.client = self.connect()
+            self._client = self.connect()
             self.total_fails = 0
         out = None
         ret = -2
@@ -172,7 +186,7 @@ class OBAClient:
         while attempts < self.max_attempts:
             attempts += 1
             try:
-                out = _query_stop_schedule(self.client, stop_id, date)
+                out = _query_stop_schedules(self._client, stop_ids, date)
                 ret = 0
             except Exception as e:
                 self.logger.error(f"    Error querying stop schedule: {e}")
@@ -187,7 +201,7 @@ class OBAClient:
         # if we've failed too many times, try to reconnect
         if self.total_fails > self.max_attempts * 5:
             self.logger.info("Attempting to reconnecting to OneBusAway...")
-            self.client = self.connect()
+            self._client = self.connect()
             self.total_fails = 0
         out = (None, None)
         ret = -2
@@ -195,7 +209,7 @@ class OBAClient:
         while attempts < self.max_attempts:
             attempts += 1
             try:
-                out = _query_arrival_time(self.client, stop_id, trip_id, service_date)
+                out = _query_arrival_time(self._client, stop_id, trip_id, service_date)
                 ret = 0
             except Exception as e:
                 self.logger.error(f"    Error querying arrival time: {e}")
@@ -205,6 +219,9 @@ class OBAClient:
                 return out
             time.sleep(self.sleep_time)
         return out
+    
+    def close(self):
+        self._client.close()
 
 
 class SqliteDB:
@@ -336,12 +353,12 @@ async def stoptrip_task(task_id: int,
             )
             scrape_time = time.time() * 1000
             if pr_arr_time is None:
-                # query returned no data - usually due to invalid parameters
+                # the query returned no data - usually due to invalid parameters
                 logger.info(f"    STOPPING - ARRIVAL TIME QUERY RETURNED NO DATA")
                 continue
             elif pr_arr_time == -1:
                 # data received, but no predicted arrival time...
-                if dist < 0:
+                if dist <= 0:
                     # bus has already passed the stop but no prediction in data
                     # (ideally, shouldn't really happen)
                     logger.info(f"    TRIP PASSED BUT NO PREDICTION (dist={dist :.2f}m)")
@@ -355,7 +372,7 @@ async def stoptrip_task(task_id: int,
                 else:
                     # bus not even live yet, check again closer to scheduled time 
                     wait_secs = arrival_gap/1000
-                    logger.info(f"    WAITING {wait_secs :.2f}s - TRIP NOT YET LIVE")
+                    logger.info(f"    WAITING {wait_secs :.2f}s - TRIP NOT YET LIVE (dist={dist :.2f}m)")
                     await asyncio.sleep(wait_secs)
                     await queue.put(params)
                     continue
@@ -387,7 +404,7 @@ async def daily_process(
         client: OBAClient,
         dbconn: SqliteDB,
         logger: logging.Logger,
-        stop_id: str,
+        stop_ids: list[str],
         current_date: str
     ):
     """
@@ -412,13 +429,12 @@ async def daily_process(
     But this doesn't apply to my current stops of interest.
     """
     # load stop schedule for the current service date
-    logger.info(f"** STOP ID: {stop_id} | SERVICE DATE: {current_date}")
     logger.info(f"** Querying stop schedule...")
-    stop_schedule = client.query_stop_schedule(
-        stop_id=stop_id,
+    stop_schedule = client.query_stop_schedules(
+        stop_ids=stop_ids,
         date=current_date
     )
-    stop_schedule.write_parquet(PATH_PREFIX + f"stop_schedule/{stop_id}__{current_date}.parquet")
+    stop_schedule.write_parquet(PATH_PREFIX + f"stop_schedule/{current_date}.parquet")
 
     logger.info("** Queueing up work and generating async tasks...")
     # add each stop-trip to the work queue to be processed
@@ -426,7 +442,7 @@ async def daily_process(
     for i in range(stop_schedule.height):
         trip = stop_schedule.filter(row_ix=i)
         params = StopTripTaskParams(
-            stop_id=stop_id,
+            stop_id=trip["stop_id"].item(),
             trip_id=trip["trip_id"].item(),
             service_date=trip["service_date"].item(),
             scheduled_arrival=trip["arrival_time"].item(),
@@ -454,9 +470,12 @@ async def daily_process(
 
 
 
-STOP_ID = "1_29278"   # 23rd & Republican
-DBPATH  = PATH_PREFIX + "scrape.db"
-LOGPATH = PATH_PREFIX + f"scrape_{datetime.datetime.now().date()}.log"
+STOP_IDS = [
+    "1_29278",   # 23rd & Republican, northbound   (43, 48)
+    "1_11200",   # Broadway & E Mercer, northbound (49)
+]
+DBPATH  = PATH_PREFIX + "data.db"
+LOGPATH = PATH_PREFIX + "run.log"
 def main():
     logger = get_logger(LOGPATH)
     logger.setLevel(logging.INFO)
@@ -496,20 +515,20 @@ def main():
                         client=client,
                         dbconn=dbconn,
                         logger=logger,
-                        stop_id=STOP_ID,
+                        stop_ids=STOP_IDS,
                         current_date=current_date
                     )
                 )
 
     except (Exception, KeyboardInterrupt) as e:
         if isinstance(e, KeyboardInterrupt):
-            logger.info("Keyboard interrupt received. Exiting app.")
+            logger.info("Keyboard interrupt received.")
         else:
             logger.error(f"Error: {e}")
-        logger.info("Exiting app.")
 
+        logger.info("Exiting app.")
         dbconn.close()
-        client.client.close()
+        client.close()
     
 
 if __name__ == "__main__":
