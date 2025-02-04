@@ -2,7 +2,7 @@
 import sqlite3
 from datetime import datetime
 
-DB_FILE = "./app/data.db"
+DB_FILE = "./app/data/data.db"
 
 def progress(status, remaining, total):
     print(f"Copied {total-remaining} of {total} pages...")
