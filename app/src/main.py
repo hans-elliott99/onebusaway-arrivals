@@ -109,9 +109,9 @@ def _query_stop_schedule(client, stop_id, date):
     return stop_schedule
 
 
-def _query_stop_schedules(client, stop_ids, date):
+def _query_stop_schedules(client, stop_ids, date) -> pl.DataFrame:
     """
-    return a dictionary of stop schedules
+    return a dataframe of stop schedules
     """
     dfs = []
     for stop_id in stop_ids:
@@ -228,13 +228,26 @@ class SqliteDB:
     def __init__(self, path):
         self.path = path
         self.conn = sqlite3.connect(path, check_same_thread=False)
-        self._create_arrivals_table(self.conn)
+        self._create_arrivals_table()
+        self._create_schedule_table()
     
-    def _create_arrivals_table(self, conn):
+    def _create_arrivals_table(self):
         c = self.conn.cursor()
         c.execute(
         "CREATE TABLE IF NOT EXISTS arrivals " +
-        "(stop_id TEXT, trip_id TEXT, service_date INTEGER, schedule_id INTEGER, scheduled_arrival INTEGER, last_predicted_arrival INTEGER, distance_when_scraped REAL, time_when_scraped INTEGER)"
+        "(stop_id TEXT, trip_id TEXT, route_id TEXT, service_date INTEGER, schedule_id INTEGER, scheduled_arrival INTEGER," +
+        " last_predicted_arrival INTEGER, distance_when_scraped REAL, time_when_scraped INTEGER)"
+        )
+        self.conn.commit()
+        c.close()
+    
+    def _create_schedule_table(self):
+        c = self.conn.cursor()
+        c.execute(
+        "CREATE TABLE IF NOT EXISTS stop_schedule " +
+        "(route_id TEXT, service_date INTEGER, trip_id TEXT, arrival_enabled INTEGER, arrival_time INTEGER," +
+        " departure_enabled INTEGER, departure_time INTEGER, service_id TEXT, arrival_time_str TEXT, date TEXT," +
+        " hour INTEGER, minute INTEGER, stop_id TEXT, row_ix INTEGER)"
         )
         self.conn.commit()
         c.close()
@@ -242,6 +255,7 @@ class SqliteDB:
     def insert_arrival(self,
                        stop_id,
                        trip_id,
+                       route_id,
                        service_date,
                        schedule_id,
                        scheduled_arrival,
@@ -249,10 +263,21 @@ class SqliteDB:
                        distance_when_scraped,
                        time_when_scraped):
         c = self.conn.cursor()
-        c.execute("INSERT INTO arrivals VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                  (stop_id, trip_id, service_date, schedule_id, scheduled_arrival, last_predicted_arrival, distance_when_scraped, time_when_scraped))
+        c.execute("INSERT INTO arrivals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  (stop_id, trip_id, route_id, service_date, schedule_id,
+                   scheduled_arrival, last_predicted_arrival, distance_when_scraped, time_when_scraped))
         self.conn.commit()
         c.close()
+    
+    def insert_stop_schedule(self, stop_schedule: pl.DataFrame):
+        # append to the stop_schedule table
+        conn_str = "sqlite:///" + self.path
+        stop_schedule.write_database(
+            table_name="stop_schedule",
+            connection=conn_str,
+            if_table_exists="append",
+            engine="sqlalchemy"
+        )
     
     def close(self):
         self.conn.close()
@@ -283,26 +308,24 @@ def get_logger(filepath):
 #
 # MAIN
 #
-# Plan:
 # Start running the program.
 # Each day it will need to collect the schedule for the stops of interest.
-# It will use the scheduled arrival times to create an execution schedule:
-#   It will plan to start checking in on each stop at the scheduled arrival time.
-#   Once it checks:
+# It will use the scheduled arrival times to create an execution plan:
+#   Start by checking in on each stop at its scheduled arrival time.
+#   Upon checking:
 #   - If the bus has not passed the stop yet (or still isn't live), check again
-#     in X minutes (determine X based on distance from stop...current predicted arr time)
+#     in X minutes (determine X based on distance from stop...current predicted arr time, etc.)
 #     - At some point, if the bus is still not live, it probably won't come. Move on.
 #   - If the bus has passed the stop, collect the last recorded predicted arrival time.
 #     (It stops updating once the bus passes the stop, so this is the "final prediction".
 #      But once the trip ends, we can no longer query this prediction.)
 #
-# For now, keep it simple and just scrape one stop.
-#
 
 class StopTripTaskParams:
-    def __init__(self, stop_id, trip_id, service_date, scheduled_arrival, schedule_id):
+    def __init__(self, stop_id, trip_id, route_id, service_date, scheduled_arrival, schedule_id):
         self.stop_id = stop_id
         self.trip_id = trip_id
+        self.route_id = route_id
         self.service_date = service_date
         self.scheduled_arrival = scheduled_arrival
         self.schedule_id = schedule_id
@@ -328,11 +351,14 @@ async def stoptrip_task(task_id: int,
         params = await queue.get()
         stop_id = params.stop_id
         trip_id = params.trip_id
+        route_id = params.route_id
         schedule_id = params.schedule_id
         service_date = params.service_date
         scheduled_arrival = params.scheduled_arrival
 
-        logger.info(f"[task {task_id}] stop: {stop_id}, trip: {trip_id}, scheduled: {sysdt_to_logtime(scheduled_arrival)}")
+        logger.info(
+            f"[task {task_id}] stop: {stop_id}, trip: {trip_id}, route: {route_id}, scheduled: {sysdt_to_logtime(scheduled_arrival)}"
+        )
 
         now = time.time() * 1000
         arrival_gap = scheduled_arrival - now
@@ -356,19 +382,24 @@ async def stoptrip_task(task_id: int,
             )
             scrape_time = time.time() * 1000
             if pr_arr_time is None:
-                # the query returned no data - usually due to invalid parameters
+                # the query returned no data - usually due to invalid combination of parameters in query
                 logger.info(f"    STOPPING - ARRIVAL TIME QUERY RETURNED NO DATA")
                 continue
             elif pr_arr_time == -1:
                 # data received, but no predicted arrival time...
                 if dist <= 0:
                     # bus has already passed the stop but no prediction in data
-                    # (ideally, shouldn't really happen)
-                    logger.info(f"    TRIP PASSED BUT NO PREDICTION (dist={dist :.2f}m)")
+                    # (ideally, this shouldn't really happen)
+                    logger.info(f"    TRIP PASSED BUT NO PREDICTION. RECORDING. (dist={dist :.2f}m)")
                     dbconn.insert_arrival(
-                        stop_id=stop_id, trip_id=trip_id, service_date=service_date,
-                        schedule_id=schedule_id, scheduled_arrival=scheduled_arrival,
-                        last_predicted_arrival=pr_arr_time, distance_when_scraped=dist,
+                        stop_id=stop_id,
+                        trip_id=trip_id,
+                        route_id=route_id,
+                        service_date=service_date,
+                        schedule_id=schedule_id,
+                        scheduled_arrival=scheduled_arrival,
+                        last_predicted_arrival=pr_arr_time,
+                        distance_when_scraped=dist,
                         time_when_scraped=scrape_time
                     )
                     continue
@@ -391,9 +422,14 @@ async def stoptrip_task(task_id: int,
                 # bus has passed the stop and we have a prediction
                 logger.info(f"    ARRIVED!! ARRIVAL: {sysdt_to_logtime(pr_arr_time)}")
                 dbconn.insert_arrival(
-                    stop_id=stop_id, trip_id=trip_id, service_date=service_date,
-                    schedule_id=schedule_id, scheduled_arrival=scheduled_arrival,
-                    last_predicted_arrival=pr_arr_time, distance_when_scraped=dist,
+                    stop_id=stop_id,
+                    trip_id=trip_id,
+                    route_id=route_id,
+                    service_date=service_date,
+                    schedule_id=schedule_id,
+                    scheduled_arrival=scheduled_arrival,
+                    last_predicted_arrival=pr_arr_time,
+                    distance_when_scraped=dist,
                     time_when_scraped=scrape_time
                 )
                 continue
@@ -411,9 +447,9 @@ async def daily_process(
         current_date: str
     ):
     """
-    Firt we query the stop schedule for the stop of interest.
+    First we query the stop schedule for the stop of interest.
     Then we loop through all scheduled arrivals at the stop and add their
-      parameters (i.e., context needed for scraping api) to a work queue.
+      parameters (i.e., context needed for scraping the API) to a work queue.
     Then we create a task for every scheduled arrival at the stop, so that
       there are guaranteed to be enough free tasks to process the work queue.
       - Each task determines if it needs to wait (based on the scheduled
@@ -429,7 +465,7 @@ async def daily_process(
     the same trip and sometimes a single vehicle visits the same stop multiple
     times on one trip. However, we can't get that info from the stop schedule.
     I believe we'd need to fully monitor a vehicle to get that info.
-    But this doesn't apply to my current stops of interest.
+    But this doesn't apply to the current stops of interest, so ignore for now.
     """
     # load stop schedule for the current service date
     logger.info(f"** Querying stop schedule...")
@@ -437,7 +473,8 @@ async def daily_process(
         stop_ids=stop_ids,
         date=current_date
     )
-    stop_schedule.write_parquet(PATH_PREFIX + f"{current_date}.parquet")
+    ## stop_schedule.write_parquet(PATH_PREFIX + f"{current_date}.parquet")
+    dbconn.insert_stop_schedule(stop_schedule)
 
     logger.info("** Queueing up work and generating async tasks...")
     # add each stop-trip to the work queue to be processed
@@ -447,6 +484,7 @@ async def daily_process(
         params = StopTripTaskParams(
             stop_id=trip["stop_id"].item(),
             trip_id=trip["trip_id"].item(),
+            route_id=trip["route_id"].item(),
             service_date=trip["service_date"].item(),
             scheduled_arrival=trip["arrival_time"].item(),
             schedule_id=i
@@ -482,6 +520,7 @@ LOGPATH = PATH_PREFIX + "run.log"
 def main():
     logger = get_logger(LOGPATH)
     logger.setLevel(logging.INFO)
+    logger.info("\n\n")
     logger.info("-------------------------------------------------")
     logger.info(f"Starting app.") 
 
@@ -532,7 +571,7 @@ def main():
         # add entry for interruption 
         exit_time = time.time() * 1000
         dbconn.insert_arrival(
-            stop_id="-1", trip_id="-1", service_date="0",
+            stop_id="-1", trip_id="-1", route_id="-1", service_date="0",
             schedule_id=-1, scheduled_arrival=0,
             last_predicted_arrival=0, distance_when_scraped=0,
             time_when_scraped=exit_time
