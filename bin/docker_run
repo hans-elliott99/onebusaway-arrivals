@@ -1,3 +1,8 @@
 #!/usr/bin/env bash
 
-sudo docker run -d --name onebusaway-container -v /home/hans/onebusaway-arrivals/app/data:/app/data onebusaway-arrivals
+sudo docker run \
+    --detach \
+    --name onebusaway-container \
+    --restart unless-stopped \
+    --env TZ=America/Los_Angeles \
+    --volume /home/hans/onebusaway-arrivals/app/data:/app/data onebusaway-arrivals
